@@ -93,6 +93,53 @@ const verifyCustomer = (req, res, next) => {
   next();
 };
 
+// ---------- helpers ----------
+
+const CATEGORIES = [
+  "Classic Pizzas",
+  "Vegetarian Pizzas",
+  "Meat Lovers",
+  "Specialty / Gourmet Pizzas",
+  "Sides & Appetizers",
+  "Beverages & Desserts",
+];
+
+const FREE_ITEM_LIMIT = 3;
+
+// turns a string into an ObjectId, or null if it is not a valid id
+const toObjectId = (id) => (ObjectId.isValid(id) ? new ObjectId(id) : null);
+
+// premium = paid plan that has not expired
+const isPremium = (user) =>
+  user.subscriptionPlan === "premium" &&
+  (!user.subscriptionExpiresAt ||
+    new Date(user.subscriptionExpiresAt) > new Date());
+
+// pending + approved items count as "active" for the free limit
+const countActiveItems = (vendorId) =>
+  menuItemsCollection.countDocuments({
+    vendorId,
+    status: { $in: ["pending", "approved"] },
+  });
+
+// checks the form data; returns an error message, or null if everything is fine
+const validateMenuItem = (body) => {
+  const { itemName, category, description, price, location, images } = body;
+  if (!itemName || itemName.trim().length < 3)
+    return "Item name must be at least 3 characters";
+  if (!CATEGORIES.includes(category)) return "Please choose a valid category";
+  if (!description || description.trim().length < 10)
+    return "Description must be at least 10 characters";
+  if (typeof price !== "number" || price <= 0)
+    return "Price must be a number greater than 0";
+  if (!location || location.trim().length < 2) return "Please enter a location";
+  if (!Array.isArray(images) || images.length === 0)
+    return "Please upload at least one image";
+  return null;
+};
+
+// ---------- routes ----------
+
 // ---------- routes ----------
 
 app.get("/", (req, res) => {
@@ -103,6 +150,50 @@ app.get("/", (req, res) => {
 app.get("/me", verifyToken, (req, res) => {
   const { _id, name, email, role, subscriptionPlan } = req.user;
   res.send({ _id, name, email, role, subscriptionPlan });
+});
+
+// ---------- menu items (vendor) ----------
+
+// create a menu item
+app.post("/menu-items", verifyToken, verifyVendor, async (req, res) => {
+  try {
+    const error = validateMenuItem(req.body);
+    if (error) return res.status(400).send({ message: error });
+
+    // free plan limit
+    if (!isPremium(req.user)) {
+      const activeCount = await countActiveItems(req.user._id);
+      if (activeCount >= FREE_ITEM_LIMIT) {
+        return res.status(403).send({
+          message: `Free plan allows only ${FREE_ITEM_LIMIT} active items. Upgrade to Premium for unlimited items.`,
+        });
+      }
+    }
+
+    const { itemName, category, description, price, location, images } =
+      req.body;
+    const menuItem = {
+      vendorId: req.user._id, // from the verified token, never from the form
+      itemName: itemName.trim(),
+      category,
+      description: description.trim(),
+      price,
+      location: location.trim(),
+      images,
+      status: "pending",
+      createdAt: new Date(),
+    };
+
+    const result = await menuItemsCollection.insertOne(menuItem);
+    res.status(201).send({
+      insertedId: result.insertedId,
+      message: "Menu item submitted for review",
+    });
+  } catch {
+    res
+      .status(500)
+      .send({ message: "Could not save the menu item. Please try again." });
+  }
 });
 
 app.listen(port, () => {
