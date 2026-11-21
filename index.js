@@ -250,11 +250,9 @@ app.patch("/menu-items/:id", verifyToken, verifyVendor, async (req, res) => {
     if (!wasActive && !isPremium(req.user)) {
       const activeCount = await countActiveItems(req.user._id);
       if (activeCount >= FREE_ITEM_LIMIT) {
-        return res
-          .status(403)
-          .send({
-            message: `Free plan allows only ${FREE_ITEM_LIMIT} active items.`,
-          });
+        return res.status(403).send({
+          message: `Free plan allows only ${FREE_ITEM_LIMIT} active items.`,
+        });
       }
     }
 
@@ -316,11 +314,9 @@ app.patch(
           !isPremium(req.user) &&
           (await countActiveItems(req.user._id)) >= FREE_ITEM_LIMIT
         ) {
-          return res
-            .status(403)
-            .send({
-              message: `Free plan allows only ${FREE_ITEM_LIMIT} active items.`,
-            });
+          return res.status(403).send({
+            message: `Free plan allows only ${FREE_ITEM_LIMIT} active items.`,
+          });
         }
         await menuItemsCollection.updateOne(
           { _id: item._id },
@@ -362,6 +358,112 @@ app.delete("/menu-items/:id", verifyToken, verifyVendor, async (req, res) => {
     res.send({ message: "Menu item deleted" });
   } catch {
     res.status(500).send({ message: "Could not delete the menu item" });
+  }
+});
+
+// ---------- menu items (public) ----------
+
+// adds the vendor's public info (name, restaurant, photo, plan) to each item
+const vendorLookup = [
+  {
+    $lookup: {
+      from: "users",
+      localField: "vendorId",
+      foreignField: "_id",
+      as: "vendor",
+    },
+  },
+  { $unwind: "$vendor" },
+  {
+    $addFields: {
+      "vendor.isPremium": {
+        $and: [
+          { $eq: ["$vendor.subscriptionPlan", "premium"] },
+          { $gt: ["$vendor.subscriptionExpiresAt", "$$NOW"] },
+        ],
+      },
+    },
+  },
+  {
+    $project: {
+      itemName: 1,
+      category: 1,
+      description: 1,
+      price: 1,
+      location: 1,
+      images: 1,
+      status: 1,
+      createdAt: 1,
+      vendorId: 1,
+      "vendor.name": 1,
+      "vendor.businessName": 1,
+      "vendor.image": 1,
+      "vendor.isPremium": 1,
+    },
+  },
+];
+
+// browse: only approved items, with search, filters and sorting
+app.get("/menu-items", async (req, res) => {
+  try {
+    const { search, category, location, sort } = req.query;
+    const match = { status: "approved" };
+
+    if (search) match.itemName = { $regex: search, $options: "i" };
+    if (category && CATEGORIES.includes(category)) match.category = category;
+    if (location) match.location = { $regex: location, $options: "i" };
+
+    const sortBy =
+      sort === "price_asc"
+        ? { price: 1 }
+        : sort === "price_desc"
+          ? { price: -1 }
+          : { createdAt: -1 };
+
+    const items = await menuItemsCollection
+      .aggregate([{ $match: match }, { $sort: sortBy }, ...vendorLookup])
+      .toArray();
+    res.send(items);
+  } catch {
+    res.status(500).send({ message: "Could not load the menu" });
+  }
+});
+
+// home page: approved items, Premium vendors first
+app.get("/menu-items/featured", async (req, res) => {
+  try {
+    const items = await menuItemsCollection
+      .aggregate([
+        { $match: { status: "approved" } },
+        ...vendorLookup,
+        { $sort: { "vendor.isPremium": -1, createdAt: -1 } },
+        { $limit: 8 },
+      ])
+      .toArray();
+    res.send(items);
+  } catch {
+    res.status(500).send({ message: "Could not load featured items" });
+  }
+});
+
+// item details: only approved items
+app.get("/menu-items/:id", async (req, res) => {
+  try {
+    const _id = toObjectId(req.params.id);
+    if (!_id)
+      return res.status(404).send({ message: "This menu item does not exist" });
+
+    const [item] = await menuItemsCollection
+      .aggregate([{ $match: { _id, status: "approved" } }, ...vendorLookup])
+      .toArray();
+
+    if (!item)
+      return res
+        .status(404)
+        .send({ message: "This menu item does not exist or is not available" });
+    res.send(item);
+  } catch {
+    res.status(500).send({ message: "Could not load the menu item" });
   }
 });
 
