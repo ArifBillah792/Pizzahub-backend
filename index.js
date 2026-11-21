@@ -140,8 +140,6 @@ const validateMenuItem = (body) => {
 
 // ---------- routes ----------
 
-// ---------- routes ----------
-
 app.get("/", (req, res) => {
   res.send({ message: "PizzaHub server is running" });
 });
@@ -193,6 +191,177 @@ app.post("/menu-items", verifyToken, verifyVendor, async (req, res) => {
     res
       .status(500)
       .send({ message: "Could not save the menu item. Please try again." });
+  }
+});
+
+// helper: find an item that belongs to the logged-in vendor
+const findOwnItem = async (id, vendorId) => {
+  const _id = toObjectId(id);
+  if (!_id) return { status: 404, message: "Menu item not found" };
+  const item = await menuItemsCollection.findOne({ _id });
+  if (!item) return { status: 404, message: "Menu item not found" };
+  if (!item.vendorId.equals(vendorId)) {
+    return { status: 403, message: "You can only manage your own menu items" };
+  }
+  return { item };
+};
+
+// my menu items (newest first)
+app.get("/menu-items/mine", verifyToken, verifyVendor, async (req, res) => {
+  try {
+    const items = await menuItemsCollection
+      .find({ vendorId: req.user._id })
+      .sort({ createdAt: -1 })
+      .toArray();
+    res.send(items);
+  } catch {
+    res.status(500).send({ message: "Could not load your menu items" });
+  }
+});
+
+// one of my items (for the edit page)
+app.get("/menu-items/mine/:id", verifyToken, verifyVendor, async (req, res) => {
+  try {
+    const { item, status, message } = await findOwnItem(
+      req.params.id,
+      req.user._id,
+    );
+    if (!item) return res.status(status).send({ message });
+    res.send(item);
+  } catch {
+    res.status(500).send({ message: "Could not load the menu item" });
+  }
+});
+
+// update my item: it goes back to "pending" so the admin reviews the changes
+app.patch("/menu-items/:id", verifyToken, verifyVendor, async (req, res) => {
+  try {
+    const { item, status, message } = await findOwnItem(
+      req.params.id,
+      req.user._id,
+    );
+    if (!item) return res.status(status).send({ message });
+
+    const error = validateMenuItem(req.body);
+    if (error) return res.status(400).send({ message: error });
+
+    // a hidden or rejected item becomes active again, so check the free limit
+    const wasActive = ["pending", "approved"].includes(item.status);
+    if (!wasActive && !isPremium(req.user)) {
+      const activeCount = await countActiveItems(req.user._id);
+      if (activeCount >= FREE_ITEM_LIMIT) {
+        return res
+          .status(403)
+          .send({
+            message: `Free plan allows only ${FREE_ITEM_LIMIT} active items.`,
+          });
+      }
+    }
+
+    const { itemName, category, description, price, location, images } =
+      req.body;
+    await menuItemsCollection.updateOne(
+      { _id: item._id },
+      {
+        $set: {
+          itemName: itemName.trim(),
+          category,
+          description: description.trim(),
+          price,
+          location: location.trim(),
+          images,
+          status: "pending",
+          updatedAt: new Date(),
+        },
+      },
+    );
+    res.send({ message: "Menu item updated and sent for review" });
+  } catch {
+    res.status(500).send({ message: "Could not update the menu item" });
+  }
+});
+
+// hide (inactive) or show again (approved) one of my items
+app.patch(
+  "/menu-items/:id/availability",
+  verifyToken,
+  verifyVendor,
+  async (req, res) => {
+    try {
+      const { available } = req.body;
+      if (typeof available !== "boolean") {
+        return res
+          .status(400)
+          .send({ message: "available must be true or false" });
+      }
+
+      const { item, status, message } = await findOwnItem(
+        req.params.id,
+        req.user._id,
+      );
+      if (!item) return res.status(status).send({ message });
+
+      if (available) {
+        if (item.status !== "inactive") {
+          return res
+            .status(400)
+            .send({ message: "Only hidden items can be made available" });
+        }
+        if (item.inactiveBy === "admin") {
+          return res
+            .status(403)
+            .send({ message: "This item was deactivated by an admin" });
+        }
+        if (
+          !isPremium(req.user) &&
+          (await countActiveItems(req.user._id)) >= FREE_ITEM_LIMIT
+        ) {
+          return res
+            .status(403)
+            .send({
+              message: `Free plan allows only ${FREE_ITEM_LIMIT} active items.`,
+            });
+        }
+        await menuItemsCollection.updateOne(
+          { _id: item._id },
+          { $set: { status: "approved" }, $unset: { inactiveBy: "" } },
+        );
+        return res.send({ message: "Item is available again" });
+      }
+
+      if (item.status !== "approved") {
+        return res
+          .status(400)
+          .send({ message: "Only approved items can be hidden" });
+      }
+      await menuItemsCollection.updateOne(
+        { _id: item._id },
+        { $set: { status: "inactive", inactiveBy: "vendor" } },
+      );
+      res.send({ message: "Item hidden from customers" });
+    } catch {
+      res.status(500).send({ message: "Could not change availability" });
+    }
+  },
+);
+
+// delete my item (its pending orders are cancelled)
+app.delete("/menu-items/:id", verifyToken, verifyVendor, async (req, res) => {
+  try {
+    const { item, status, message } = await findOwnItem(
+      req.params.id,
+      req.user._id,
+    );
+    if (!item) return res.status(status).send({ message });
+
+    await menuItemsCollection.deleteOne({ _id: item._id });
+    await ordersCollection.updateMany(
+      { itemId: item._id, status: "pending" },
+      { $set: { status: "cancelled" } },
+    );
+    res.send({ message: "Menu item deleted" });
+  } catch {
+    res.status(500).send({ message: "Could not delete the menu item" });
   }
 });
 
