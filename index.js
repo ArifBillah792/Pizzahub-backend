@@ -467,6 +467,247 @@ app.get("/menu-items/:id", async (req, res) => {
   }
 });
 
+// ---------- orders ----------
+
+const ORDER_LOOKUPS = [
+  {
+    $lookup: {
+      from: "menuItems",
+      localField: "itemId",
+      foreignField: "_id",
+      as: "item",
+    },
+  },
+  { $unwind: { path: "$item", preserveNullAndEmptyArrays: true } },
+  {
+    $lookup: {
+      from: "users",
+      localField: "vendorId",
+      foreignField: "_id",
+      as: "vendor",
+    },
+  },
+  { $unwind: { path: "$vendor", preserveNullAndEmptyArrays: true } },
+  {
+    $lookup: {
+      from: "users",
+      localField: "customerId",
+      foreignField: "_id",
+      as: "customer",
+    },
+  },
+  { $unwind: { path: "$customer", preserveNullAndEmptyArrays: true } },
+  {
+    $project: {
+      deliveryDate: 1,
+      deliveryAddress: 1,
+      message: 1,
+      status: 1,
+      createdAt: 1,
+      updatedAt: 1,
+      "item._id": 1,
+      "item.itemName": 1,
+      "item.images": 1,
+      "item.price": 1,
+      "vendor.name": 1,
+      "vendor.businessName": 1,
+      "customer.name": 1,
+      "customer.email": 1,
+      "customer.image": 1,
+    },
+  },
+];
+
+// customer places an order
+app.post("/orders", verifyToken, verifyCustomer, async (req, res) => {
+  try {
+    const { itemId, deliveryDate, deliveryAddress, message = "" } = req.body;
+
+    const _itemId = toObjectId(itemId);
+    if (!_itemId)
+      return res.status(404).send({ message: "Menu item not found" });
+
+    const item = await menuItemsCollection.findOne({
+      _id: _itemId,
+      status: "approved",
+    });
+    if (!item)
+      return res
+        .status(404)
+        .send({ message: "This item is not available for ordering" });
+
+    if (item.vendorId.equals(req.user._id)) {
+      return res
+        .status(403)
+        .send({ message: "You cannot order your own item" });
+    }
+
+    // delivery date: a real date, today or later
+    const date = new Date(`${deliveryDate}T00:00:00.000Z`);
+    const today = new Date(
+      new Date().toISOString().slice(0, 10) + "T00:00:00.000Z",
+    );
+    if (!deliveryDate || isNaN(date))
+      return res.status(400).send({ message: "Please choose a delivery date" });
+    if (date < today)
+      return res
+        .status(400)
+        .send({ message: "Delivery date cannot be in the past" });
+
+    if (!deliveryAddress || deliveryAddress.trim().length < 5) {
+      return res
+        .status(400)
+        .send({ message: "Please enter a full delivery address" });
+    }
+    if (message.length > 300)
+      return res
+        .status(400)
+        .send({ message: "Message must be 300 characters or less" });
+
+    // no duplicate active order for the same item and date
+    const duplicate = await ordersCollection.findOne({
+      itemId: _itemId,
+      customerId: req.user._id,
+      deliveryDate: date,
+      status: { $in: ["pending", "accepted"] },
+    });
+    if (duplicate) {
+      return res
+        .status(409)
+        .send({
+          message:
+            "You already have an active order for this item on that date",
+        });
+    }
+
+    const order = {
+      itemId: _itemId,
+      vendorId: item.vendorId,
+      customerId: req.user._id,
+      deliveryDate: date,
+      deliveryAddress: deliveryAddress.trim(),
+      message: message.trim(),
+      status: "pending",
+      createdAt: new Date(),
+    };
+    const result = await ordersCollection.insertOne(order);
+    res
+      .status(201)
+      .send({
+        insertedId: result.insertedId,
+        message: "Order placed successfully",
+      });
+  } catch {
+    res
+      .status(500)
+      .send({ message: "Could not place the order. Please try again." });
+  }
+});
+
+// customer: my orders
+app.get("/orders/mine", verifyToken, verifyCustomer, async (req, res) => {
+  try {
+    const orders = await ordersCollection
+      .aggregate([
+        { $match: { customerId: req.user._id } },
+        { $sort: { createdAt: -1 } },
+        ...ORDER_LOOKUPS,
+      ])
+      .toArray();
+    res.send(orders);
+  } catch {
+    res.status(500).send({ message: "Could not load your orders" });
+  }
+});
+
+// customer: cancel my pending order
+app.patch(
+  "/orders/:id/cancel",
+  verifyToken,
+  verifyCustomer,
+  async (req, res) => {
+    try {
+      const _id = toObjectId(req.params.id);
+      if (!_id) return res.status(404).send({ message: "Order not found" });
+
+      const order = await ordersCollection.findOne({ _id });
+      if (!order) return res.status(404).send({ message: "Order not found" });
+      if (!order.customerId.equals(req.user._id)) {
+        return res
+          .status(403)
+          .send({ message: "You can only cancel your own orders" });
+      }
+      if (order.status !== "pending") {
+        return res
+          .status(400)
+          .send({
+            message: `This order is already ${order.status} and cannot be cancelled`,
+          });
+      }
+
+      await ordersCollection.updateOne(
+        { _id },
+        { $set: { status: "cancelled", updatedAt: new Date() } },
+      );
+      res.send({ message: "Order cancelled" });
+    } catch {
+      res.status(500).send({ message: "Could not cancel the order" });
+    }
+  },
+);
+
+// vendor: orders for my items
+app.get("/orders/vendor", verifyToken, verifyVendor, async (req, res) => {
+  try {
+    const orders = await ordersCollection
+      .aggregate([
+        { $match: { vendorId: req.user._id } },
+        { $sort: { createdAt: -1 } },
+        ...ORDER_LOOKUPS,
+      ])
+      .toArray();
+    res.send(orders);
+  } catch {
+    res.status(500).send({ message: "Could not load customer orders" });
+  }
+});
+
+// vendor: accept or reject a pending order (only once)
+app.patch("/orders/:id/status", verifyToken, verifyVendor, async (req, res) => {
+  try {
+    const { status } = req.body;
+    if (!["accepted", "rejected"].includes(status)) {
+      return res
+        .status(400)
+        .send({ message: "Status must be accepted or rejected" });
+    }
+
+    const _id = toObjectId(req.params.id);
+    if (!_id) return res.status(404).send({ message: "Order not found" });
+
+    const order = await ordersCollection.findOne({ _id });
+    if (!order) return res.status(404).send({ message: "Order not found" });
+    if (!order.vendorId.equals(req.user._id)) {
+      return res
+        .status(403)
+        .send({ message: "You can only manage orders for your own items" });
+    }
+    if (order.status !== "pending") {
+      return res
+        .status(400)
+        .send({ message: `This order is already ${order.status}` });
+    }
+
+    await ordersCollection.updateOne(
+      { _id },
+      { $set: { status, updatedAt: new Date() } },
+    );
+    res.send({ message: `Order ${status}` });
+  } catch {
+    res.status(500).send({ message: "Could not update the order" });
+  }
+});
+
 app.listen(port, () => {
   console.log(`PizzaHub server running on port ${port}`);
 });
