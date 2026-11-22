@@ -6,13 +6,18 @@ import cors from "cors";
 import "dotenv/config";
 import { MongoClient, ObjectId } from "mongodb";
 import { createRemoteJWKSet, jwtVerify } from "jose";
+import Stripe from "stripe";
 
 const app = express();
 const port = process.env.PORT || 5000;
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 // middleware
 app.use(cors({ origin: process.env.CLIENT_URL }));
-app.use(express.json());
+app.use((req, res, next) => {
+  if (req.originalUrl === "/stripe/webhook") return next();
+  express.json()(req, res, next);
+});
 
 // database
 const client = new MongoClient(process.env.MONGODB_URI);
@@ -146,8 +151,17 @@ app.get("/", (req, res) => {
 
 // who am I? (used to test the JWT)
 app.get("/me", verifyToken, (req, res) => {
-  const { _id, name, email, role, subscriptionPlan } = req.user;
-  res.send({ _id, name, email, role, subscriptionPlan });
+  const { _id, name, email, role, subscriptionPlan, subscriptionExpiresAt } =
+    req.user;
+  res.send({
+    _id,
+    name,
+    email,
+    role,
+    subscriptionPlan,
+    subscriptionExpiresAt,
+    isPremium: isPremium(req.user),
+  });
 });
 
 // ---------- menu items (vendor) ----------
@@ -850,6 +864,163 @@ app.get("/admin/transactions", verifyToken, verifyAdmin, async (req, res) => {
     res.status(500).send({ message: "Could not load transactions" });
   }
 });
+
+// ---------- subscriptions (Stripe) ----------
+
+// vendor starts checkout for THEIR OWN account (id from the token)
+app.post(
+  "/subscriptions/checkout",
+  verifyToken,
+  verifyVendor,
+  async (req, res) => {
+    try {
+      if (isPremium(req.user)) {
+        return res
+          .status(400)
+          .send({ message: "You are already on the Premium plan" });
+      }
+      const vendorId = req.user._id.toString();
+
+      const session = await stripe.checkout.sessions.create({
+        mode: "subscription",
+        line_items: [{ price: process.env.STRIPE_PRICE_ID, quantity: 1 }],
+        customer_email: req.user.email,
+        metadata: { vendorId },
+        subscription_data: { metadata: { vendorId } },
+        success_url: `${process.env.CLIENT_URL}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${process.env.CLIENT_URL}/payment/cancel`,
+      });
+      res.send({ url: session.url });
+    } catch {
+      res
+        .status(500)
+        .send({ message: "Could not start the payment. Please try again." });
+    }
+  },
+);
+
+// vendor cancels: Premium stays until the paid period ends
+app.post(
+  "/subscriptions/cancel",
+  verifyToken,
+  verifyVendor,
+  async (req, res) => {
+    try {
+      const lastPayment = await transactionsCollection.findOne(
+        { vendorId: req.user._id, status: "paid" },
+        { sort: { createdAt: -1 } },
+      );
+      if (!lastPayment || !isPremium(req.user)) {
+        return res
+          .status(400)
+          .send({ message: "You have no active Premium subscription" });
+      }
+      await stripe.subscriptions.update(lastPayment.stripeSubscriptionId, {
+        cancel_at_period_end: true,
+      });
+      res.send({
+        message:
+          "Subscription cancelled. Premium stays active until your paid period ends.",
+      });
+    } catch {
+      res.status(500).send({ message: "Could not cancel the subscription" });
+    }
+  },
+);
+
+// Stripe webhook: the ONLY place that activates or ends Premium
+app.post(
+  "/stripe/webhook",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    let event;
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        req.headers["stripe-signature"],
+        process.env.STRIPE_WEBHOOK_SECRET,
+      );
+    } catch (err) {
+      return res
+        .status(400)
+        .send(`Webhook signature check failed: ${err.message}`);
+    }
+
+    try {
+      // 1. payment finished → save transaction + activate Premium
+      if (event.type === "checkout.session.completed") {
+        const session = event.data.object;
+        const vendorId = toObjectId(session.metadata?.vendorId);
+        const alreadySaved = await transactionsCollection.findOne({
+          stripeSessionId: session.id,
+        });
+
+        if (vendorId && !alreadySaved && session.payment_status === "paid") {
+          const subscription = await stripe.subscriptions.retrieve(
+            session.subscription,
+          );
+          const periodEnd =
+            subscription.items?.data?.[0]?.current_period_end ??
+            subscription.current_period_end;
+
+          await transactionsCollection.insertOne({
+            vendorId,
+            plan: "premium",
+            amount: session.amount_total / 100,
+            currency: session.currency,
+            stripeSessionId: session.id,
+            stripeSubscriptionId: session.subscription,
+            status: "paid",
+            createdAt: new Date(),
+          });
+          await usersCollection.updateOne(
+            { _id: vendorId },
+            {
+              $set: {
+                subscriptionPlan: "premium",
+                subscriptionExpiresAt: new Date(periodEnd * 1000),
+              },
+            },
+          );
+        }
+      }
+
+      // 2. monthly renewal → move the expiry date forward
+      if (event.type === "customer.subscription.updated") {
+        const subscription = event.data.object;
+        const vendorId = toObjectId(subscription.metadata?.vendorId);
+        const periodEnd =
+          subscription.items?.data?.[0]?.current_period_end ??
+          subscription.current_period_end;
+        if (vendorId && subscription.status === "active" && periodEnd) {
+          await usersCollection.updateOne(
+            { _id: vendorId },
+            { $set: { subscriptionExpiresAt: new Date(periodEnd * 1000) } },
+          );
+        }
+      }
+
+      // 3. subscription ended (cancelled and expired, or payment failed) → back to Free
+      if (event.type === "customer.subscription.deleted") {
+        const subscription = event.data.object;
+        const vendorId = toObjectId(subscription.metadata?.vendorId);
+        if (vendorId) {
+          await usersCollection.updateOne(
+            { _id: vendorId },
+            {
+              $set: { subscriptionPlan: "free" },
+              $unset: { subscriptionExpiresAt: "" },
+            },
+          );
+        }
+      }
+
+      res.send({ received: true });
+    } catch {
+      res.status(500).send({ message: "Webhook handling failed" });
+    }
+  },
+);
 
 app.listen(port, () => {
   console.log(`PizzaHub server running on port ${port}`);
