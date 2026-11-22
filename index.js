@@ -1102,6 +1102,31 @@ app.get("/stats/admin", verifyToken, verifyAdmin, async (req, res) => {
   }
 });
 
+// one order: only its customer, its vendor or an admin may see it
+app.get("/orders/:id", verifyToken, async (req, res) => {
+  try {
+    const _id = toObjectId(req.params.id);
+    if (!_id) return res.status(404).send({ message: "Order not found" });
+
+    const order = await ordersCollection.findOne({ _id });
+    if (!order) return res.status(404).send({ message: "Order not found" });
+
+    const canView =
+      order.customerId.equals(req.user._id) ||
+      order.vendorId.equals(req.user._id) ||
+      req.user.role === "admin";
+    if (!canView)
+      return res.status(403).send({ message: "You cannot view this order" });
+
+    const [details] = await ordersCollection
+      .aggregate([{ $match: { _id } }, ...ORDER_LOOKUPS])
+      .toArray();
+    res.send(details);
+  } catch {
+    res.status(500).send({ message: "Could not load the order" });
+  }
+});
+
 app.listen(port, () => {
   console.log(`PizzaHub server running on port ${port}`);
 });
