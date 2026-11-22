@@ -451,7 +451,7 @@ app.get("/menu-items/featured", async (req, res) => {
         { $match: { status: "approved" } },
         ...vendorLookup,
         { $sort: { "vendor.isPremium": -1, createdAt: -1 } },
-        { $limit: 8 },
+        { $limit: 6 },
       ])
       .toArray();
     res.send(items);
@@ -1021,6 +1021,86 @@ app.post(
     }
   },
 );
+
+// ---------- dashboard stats ----------
+
+// counts documents grouped by a field, e.g. { pending: 2, accepted: 5 }
+const countBy = async (collection, match, field) => {
+  const rows = await collection
+    .aggregate([
+      { $match: match },
+      { $group: { _id: `$${field}`, count: { $sum: 1 } } },
+    ])
+    .toArray();
+  return Object.fromEntries(rows.map((r) => [r._id, r.count]));
+};
+
+const sum = (counts) => Object.values(counts).reduce((a, b) => a + b, 0);
+
+app.get("/stats/vendor", verifyToken, verifyVendor, async (req, res) => {
+  try {
+    const items = await countBy(
+      menuItemsCollection,
+      { vendorId: req.user._id },
+      "status",
+    );
+    const orders = await countBy(
+      ordersCollection,
+      { vendorId: req.user._id },
+      "status",
+    );
+    res.send({
+      totalItems: sum(items),
+      activeItems: items.approved || 0,
+      pendingOrders: orders.pending || 0,
+      acceptedOrders: orders.accepted || 0,
+      plan: isPremium(req.user) ? "Premium" : "Free",
+      itemsByStatus: items,
+      ordersByStatus: orders,
+    });
+  } catch {
+    res.status(500).send({ message: "Could not load your stats" });
+  }
+});
+
+app.get("/stats/customer", verifyToken, verifyCustomer, async (req, res) => {
+  try {
+    const orders = await countBy(
+      ordersCollection,
+      { customerId: req.user._id },
+      "status",
+    );
+    res.send({
+      totalOrders: sum(orders),
+      pendingOrders: orders.pending || 0,
+      acceptedOrders: orders.accepted || 0,
+      rejectedOrders: orders.rejected || 0,
+      ordersByStatus: orders,
+    });
+  } catch {
+    res.status(500).send({ message: "Could not load your stats" });
+  }
+});
+
+app.get("/stats/admin", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const roles = await countBy(usersCollection, {}, "role");
+    const items = await countBy(menuItemsCollection, {}, "status");
+    const totalTransactions = await transactionsCollection.countDocuments();
+    res.send({
+      totalUsers: sum(roles),
+      totalVendors: roles.vendor || 0,
+      totalCustomers: roles.customer || 0,
+      totalItems: sum(items),
+      pendingItems: items.pending || 0,
+      totalTransactions,
+      usersByRole: roles,
+      itemsByStatus: items,
+    });
+  } catch {
+    res.status(500).send({ message: "Could not load platform stats" });
+  }
+});
 
 app.listen(port, () => {
   console.log(`PizzaHub server running on port ${port}`);
