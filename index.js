@@ -572,12 +572,9 @@ app.post("/orders", verifyToken, verifyCustomer, async (req, res) => {
       status: { $in: ["pending", "accepted"] },
     });
     if (duplicate) {
-      return res
-        .status(409)
-        .send({
-          message:
-            "You already have an active order for this item on that date",
-        });
+      return res.status(409).send({
+        message: "You already have an active order for this item on that date",
+      });
     }
 
     const order = {
@@ -591,12 +588,10 @@ app.post("/orders", verifyToken, verifyCustomer, async (req, res) => {
       createdAt: new Date(),
     };
     const result = await ordersCollection.insertOne(order);
-    res
-      .status(201)
-      .send({
-        insertedId: result.insertedId,
-        message: "Order placed successfully",
-      });
+    res.status(201).send({
+      insertedId: result.insertedId,
+      message: "Order placed successfully",
+    });
   } catch {
     res
       .status(500)
@@ -638,11 +633,9 @@ app.patch(
           .send({ message: "You can only cancel your own orders" });
       }
       if (order.status !== "pending") {
-        return res
-          .status(400)
-          .send({
-            message: `This order is already ${order.status} and cannot be cancelled`,
-          });
+        return res.status(400).send({
+          message: `This order is already ${order.status} and cannot be cancelled`,
+        });
       }
 
       await ordersCollection.updateOne(
@@ -705,6 +698,156 @@ app.patch("/orders/:id/status", verifyToken, verifyVendor, async (req, res) => {
     res.send({ message: `Order ${status}` });
   } catch {
     res.status(500).send({ message: "Could not update the order" });
+  }
+});
+
+// ---------- admin ----------
+
+// all menu items (any status), with search and filters
+app.get("/admin/menu-items", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const { search, status, category } = req.query;
+    const match = {};
+    if (search) match.itemName = { $regex: search, $options: "i" };
+    if (["pending", "approved", "rejected", "inactive"].includes(status))
+      match.status = status;
+    if (category && CATEGORIES.includes(category)) match.category = category;
+
+    const items = await menuItemsCollection
+      .aggregate([
+        { $match: match },
+        { $sort: { createdAt: -1 } },
+        ...vendorLookup,
+      ])
+      .toArray();
+    res.send(items);
+  } catch {
+    res.status(500).send({ message: "Could not load menu items" });
+  }
+});
+
+// approve, reject, deactivate or reactivate an item
+app.patch(
+  "/admin/menu-items/:id/status",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const { status } = req.body;
+      if (!["approved", "rejected", "inactive"].includes(status)) {
+        return res.status(400).send({ message: "Invalid status" });
+      }
+      const _id = toObjectId(req.params.id);
+      if (!_id) return res.status(404).send({ message: "Menu item not found" });
+
+      const item = await menuItemsCollection.findOne({ _id });
+      if (!item)
+        return res.status(404).send({ message: "Menu item not found" });
+
+      const update =
+        status === "inactive"
+          ? { $set: { status, inactiveBy: "admin" } }
+          : { $set: { status }, $unset: { inactiveBy: "" } };
+      await menuItemsCollection.updateOne({ _id }, update);
+      res.send({ message: `Item ${status}` });
+    } catch {
+      res.status(500).send({ message: "Could not update the item" });
+    }
+  },
+);
+
+// delete an inappropriate item
+app.delete(
+  "/admin/menu-items/:id",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const _id = toObjectId(req.params.id);
+      if (!_id) return res.status(404).send({ message: "Menu item not found" });
+
+      const result = await menuItemsCollection.deleteOne({ _id });
+      if (result.deletedCount === 0)
+        return res.status(404).send({ message: "Menu item not found" });
+
+      await ordersCollection.updateMany(
+        { itemId: _id, status: "pending" },
+        { $set: { status: "cancelled" } },
+      );
+      res.send({ message: "Menu item deleted" });
+    } catch {
+      res.status(500).send({ message: "Could not delete the item" });
+    }
+  },
+);
+
+// all users, with search by name or email and filter by role
+app.get("/admin/users", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const { search, role } = req.query;
+    const query = {};
+    if (search) {
+      query.$or = [
+        { name: { $regex: search, $options: "i" } },
+        { email: { $regex: search, $options: "i" } },
+      ];
+    }
+    if (["admin", "vendor", "customer"].includes(role)) query.role = role;
+
+    const users = await usersCollection
+      .find(query, {
+        projection: {
+          name: 1,
+          email: 1,
+          image: 1,
+          role: 1,
+          businessName: 1,
+          subscriptionPlan: 1,
+          subscriptionExpiresAt: 1,
+          isBlocked: 1,
+          createdAt: 1,
+        },
+      })
+      .sort({ createdAt: -1 })
+      .toArray();
+    res.send(users);
+  } catch {
+    res.status(500).send({ message: "Could not load users" });
+  }
+});
+
+// all transactions (read-only: there is no route to edit them)
+app.get("/admin/transactions", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const transactions = await transactionsCollection
+      .aggregate([
+        { $sort: { createdAt: -1 } },
+        {
+          $lookup: {
+            from: "users",
+            localField: "vendorId",
+            foreignField: "_id",
+            as: "vendor",
+          },
+        },
+        { $unwind: { path: "$vendor", preserveNullAndEmptyArrays: true } },
+        {
+          $project: {
+            plan: 1,
+            amount: 1,
+            currency: 1,
+            status: 1,
+            createdAt: 1,
+            "vendor.name": 1,
+            "vendor.email": 1,
+            "vendor.businessName": 1,
+          },
+        },
+      ])
+      .toArray();
+    res.send(transactions);
+  } catch {
+    res.status(500).send({ message: "Could not load transactions" });
   }
 });
 
