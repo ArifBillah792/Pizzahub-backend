@@ -1127,6 +1127,11 @@ app.get("/orders/:id", verifyToken, async (req, res) => {
   }
 });
 
+// Unknown routes → JSON 404 (must stay after all routes)
+app.use((req, res) => {
+  res.status(404).send({ message: "Route not found" });
+});
+
 app.listen(port, () => {
   console.log(`PizzaHub server running on port ${port}`);
 });
